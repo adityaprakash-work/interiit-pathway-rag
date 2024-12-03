@@ -20,8 +20,8 @@ Example: If asked, "What are the benefits of renewable energy sources?"You might
 respond with, "Renewable energy sources offer benefits such as reduced carbon 
 emissions, energy independence, and sustainability."
 """
+
 hyde_proceed_prompt = """
-Query: {query}
 Are you confident in generating a proxy answer without hallucinating? If you are 
 unsure about the context, please say so. Respond in one word, 'YES' or 'NO'.
 """
