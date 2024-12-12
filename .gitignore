@@ -141,4 +141,5 @@ dmypy.json
 cython_debug/
 .vscode
 envs/.env
-prototypes.py
+concepts
+data
