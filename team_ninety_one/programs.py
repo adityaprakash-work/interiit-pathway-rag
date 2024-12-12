@@ -21,6 +21,7 @@ from guidance import (
     system,
     assistant,
 )
+from scipy.special import softmax
 from guidance.models import Model
 from guidance._grammar import RawFunction
 from .settings import OpenAISettings
@@ -166,6 +167,7 @@ class MCTSReasoningNode:
         self.action = action
         self.parent = parent
         if parent is None:
+            # TODO: Need a SYS Prompt here.
             with user():
                 self.lm += f"""\
                 ROOT: {state}
@@ -208,7 +210,7 @@ class MCTSReasoningNode:
         node = self
         while len(node.children) > 0:
             w = [child.ucb for child in node.children]
-            w = self.softmax(w, temperature)
+            w = self.norm_w(w, temperature)
             node = random.choices(node.children, weights=w, k=1)[0]
             if next:
                 break
@@ -229,18 +231,15 @@ class MCTSReasoningNode:
                 lm_a = (
                     node.lm
                     + f"""\
-                ROOT: {node["ROOT"]}
+                ROOT: {node.lm["ROOT"]}
                 
-                Based on the current chain of thought, try to resolve root. If
+                Based on the current chain of thought, try to resolve ROOT. If
                 already resolved rewrite the resolution.
-                
-                Please respond in a 100 tokens or less.
                 """
                 )
             with assistant():
                 lm_a += gen(
                     "mcts_simulate",
-                    max_tokens=100,
                     temperature=temperature,
                 )
             mcts_sim_ans.append(lm_a["mcts_simulate"])
@@ -248,27 +247,33 @@ class MCTSReasoningNode:
             lm_compare = (
                 node_copy.lm
                 + f"""\
-                Group responses by the specifics of their content. Reponses 
-                having similar content, for example, same determiners, same 
-                values, same outcomes, etc., should be grouped together. 
-                
-                Responses:
-                """
+            Please give a majority vote for the number of answers that agree
+            with  each other. For example if there are 5 response and 3 of
+            them agree with each other (group 1) and the remaining 2 agree
+            amongst themselves (group 2), then you must give me 3 and not 2.
+            What I need a measure of the proportion of answers that agree
+            amongst themselves (Note that there could be more than 2 such
+            self consistent groups).
+            IMPORTANT:
+            Even if responses are generally same, but if they differ in a 
+            very important detail, then consider them different.
+            
+            Responses:\n\n
+            """
             )
             for i, ans in enumerate(mcts_sim_ans):
-                lm_compare += f"{i + 1}. {ans}\n"
+                lm_compare += f"{i + 1}. {ans}\n\n"
         with assistant():
-            lm_compare += gen(max_tokens=110 * n_simulations)
+            lm_compare += gen()
         with user():
             lm_compare += f"""\
             Give me the number of members in the largest group of similar 
-            responses.
-            
-            Write a single number between 1 and {n_simulations}.
+            responses (between 1 and {n_simulations}). Write only the number, 
+            nothing else.
             """
         with assistant():
             lm_compare += select(list(range(1, n_simulations + 1)), "major_num")
-        reward = lm_compare["major_num"] / n_simulations
+        reward = int(lm_compare["major_num"]) / n_simulations
         self.update(reward)
 
     def update(self, reward: float) -> None:
@@ -280,19 +285,33 @@ class MCTSReasoningNode:
     @property
     def ucb(self) -> float:
         if self.visits == 0:
-            return float("inf")
+            # NOTE: The standard deviation should not exceed 0.5, as it may
+            # require multiple iterations to achieve valid scores, the maximum
+            # reward per simulation being 1.0
+            return 1000.0 + random.uniform(-0.2, 0.2)
         return self.Q / self.visits + self.exploration_constant * math.sqrt(
             math.log(self.parent.visits) / (self.visits + 1e-6)
         )
 
     @staticmethod
-    def softmax(values: List[float], temperature=0.1) -> List[float]:
-        values = [math.exp(v / temperature) for v in values]
-        values = [v / sum(values) for v in values]
-        return values
+    def norm_w(w: List[float], temperature=0.1) -> List[float]:
+        scaled_w = [v / temperature for v in w]
+        return softmax(scaled_w).tolist()
 
     def copy(self):
-        return copy.deepcopy(self)
+        node = MCTSReasoningNode(
+            lm=self.lm,
+            state=self.state,
+            action=self.action,
+            parent=self.parent,
+            children=self.children,
+            visits=self.visits,
+            Q=self.Q,
+            exploration_constant=self.exploration_constant,
+            is_terminal=self.is_terminal,
+            seen_actions=self.seen_actions,
+        )
+        return node
 
 
 def mcts_action(fn) -> RawFunction:
@@ -334,7 +353,7 @@ def propose_one_step_thought(lm: Model) -> Model:
     with user():
         lm += "Generate the next reasoning step based on previous steps."
     with assistant():
-        lm += gen("state", max_tokens=300)
+        lm += gen("state")
     return lm
 
 
@@ -343,7 +362,7 @@ def propose_remaining_thought_steps(lm: Model) -> Model:
     with user():
         lm += "Produce all remaining reasoning steps."
     with assistant():
-        lm += gen("state", max_tokens=300)
+        lm += gen("state")
     return lm
 
 
@@ -352,7 +371,7 @@ def generate_next_sub_question_and_answer(lm: Model) -> Model:
     with user():
         lm += "Decompose the main problem into a sequence of sub-questions."
     with assistant():
-        lm += gen("state", max_tokens=300)
+        lm += gen("state")
     return lm
 
 
@@ -361,7 +380,7 @@ def re_answer_sub_question(lm: Model) -> Model:
     with user():
         lm += "Re-answer a previously generated sub-question."
     with assistant():
-        lm += gen("state", max_tokens=300)
+        lm += gen("state")
     return lm
 
 
@@ -373,7 +392,7 @@ def rephrase_question_sub_question(lm: Model) -> Model:
         misunderstandings.
         """
     with assistant():
-        lm += gen("state", max_tokens=300)
+        lm += gen("state")
     return lm
 
 
@@ -384,7 +403,7 @@ def rstar_g(
     max_iterations: int = 10,
     max_expansions: int = 2,
     n_simulations: int = 2,
-    max_rollouts: int = 8,
+    max_rollouts: int = 4,
     sel_temp: float = 0.1,
     sim_temp: float = 0.1,
     capture_cot_in_state: bool = False,
@@ -423,7 +442,7 @@ def rstar_g(
         """
         )
     with assistant():
-        lm_rstar += gen("rstar", max_tokens=300)
+        lm_rstar += gen("rstar")
     if capture_cot_in_state:
         return lm_rstar
     else:
